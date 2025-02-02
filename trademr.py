@@ -3,233 +3,220 @@ import time
 import threading
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
+from lightgbm import LGBMClassifier
+from sklearn.preprocessing import RobustScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import accuracy_score, classification_report
-from tkinter import Tk, Label, Entry, Button, Text, END, messagebox, Frame, OptionMenu, StringVar, LabelFrame
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.metrics import make_scorer, f1_score
+from tkinter import Tk, Label, Button, Text, END, Frame, OptionMenu, StringVar, LabelFrame
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import mplfinance as mpf
 import warnings
+from imblearn.over_sampling import SMOTE
 from sklearn.exceptions import UndefinedMetricWarning
 
-# Ignorar avisos de métricas indefinidas
-warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-
 # Configurações
-CORRETORA = 'binance'  # Corretora para coletar dados
-TIMEFRAME = '1m'  # Timeframe (1 minuto)
-LIMITE_DADOS = 100  # Quantidade de dados históricos (ajustado para melhor visualização)
-STOP_LOSS = 0.02  # 2% de stop-loss
-TAKE_PROFIT = 0.03  # 3% de take-profit
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+CORRETORA = 'binance'
+TIMEFRAME = '5m'
+LIMITE_DADOS = 1000
+RISCO_REWARD_RATIO = 2.0
+TAKE_PROFIT = 0.02
+STOP_LOSS = 0.01
 
-# Moedas disponíveis
-MOEDAS_DISPONIVEIS = ['BTC/USDT', 'ETH/USDT', 'ADA/USDT', 'MELANIA/USDT']  # Adicione mais moedas conforme necessário
+MOEDAS_DISPONIVEIS = ['BTC/USDT', 'ETH/USDT', 'ADA/USDT', 'MELANIA/USDT']
 
 # Variáveis globais
 bot_rodando = False
-auto_refresh_rodando = False
 modelo = None
-historico_sinais = []
+tempo_restante = 300
+operacoes = []
+status_led = None
+
+# Interface Gráfica
+root = Tk()
+root.title("Super Bot de Trading IA Pro")
+root.configure(bg="#1a1a1a")
+moeda_selecionada = StringVar(value=MOEDAS_DISPONIVEIS[0])
+
+# Componentes da Interface
+frame_grafico = Frame(root, bg="#1a1a1a")
+fig, ax = plt.subplots(figsize=(14, 6), facecolor="#2d2d2d")
+canvas = FigureCanvasTkAgg(fig, master=frame_grafico)
+label_sinal = Label(root, text="🔄 INICIE O BOT", font=("Roboto", 24, "bold"), bg="#1a1a1a", fg="#00ff88")
+label_contagem = Label(root, text="⏳ 300s", font=("Roboto", 18), bg="#1a1a1a", fg="#ffffff")
+texto_log = Text(root, height=14, width=100, bg="#2d2d2d", fg="#ffffff", insertbackground="white")
+
+# Status LED
+status_frame = LabelFrame(root, text="Status", bg="#1a1a1a", fg="white")
+status_led = Label(status_frame, text="●", font=("Roboto", 24), bg="#1a1a1a", fg="red")
 
 
-# Função para coletar dados históricos
+def estilo_botao(botao, cor_normal, cor_hover):
+    botao.config(font=("Roboto", 12), bg=cor_normal, fg="white", relief="flat", padx=20, pady=10, bd=0)
+    botao.bind("<Enter>", lambda e: botao.config(bg=cor_hover))
+    botao.bind("<Leave>", lambda e: botao.config(bg=cor_normal))
+
+
+# Funções Aprimoradas
 def coletar_dados(moeda):
     try:
-        corretora = getattr(ccxt, CORRETORA)()
-        ohlcv = corretora.fetch_ohlcv(moeda, TIMEFRAME, limit=LIMITE_DADOS)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        exchange = getattr(ccxt, CORRETORA)({'enableRateLimit': True})
+        dados = exchange.fetch_ohlcv(moeda, TIMEFRAME, limit=LIMITE_DADOS)
+        df = pd.DataFrame(dados, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         return df
     except Exception as e:
-        raise ValueError(f"Erro ao coletar dados: {str(e)}")
+        raise ValueError(f"Erro: {str(e)}")
 
 
-# Função para calcular indicadores técnicos
 def calcular_indicadores(df):
-    # Médias móveis
-    df['SMA20'] = df['close'].rolling(window=20).mean()
-    df['SMA50'] = df['close'].rolling(window=50).mean()
+    # Indicadores avançados
+    df['SMA50'] = df['close'].rolling(50).mean()
+    df['SMA200'] = df['close'].rolling(200).mean()
+    df['EMA20'] = df['close'].ewm(span=20).mean()
 
-    # RSI (Índice de Força Relativa)
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    # Ichimoku Cloud
+    df['tenkan_sen'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
+    df['kijun_sen'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
+    df['senkou_span_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(26)
 
-    # MACD (Convergência/Divergência de Médias Móveis)
-    df['MACD'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    # Volume Profile
+    df['volume_profile'] = df['volume'] * df['close']
 
-    # Bollinger Bands
-    df['Bollinger_Upper'] = df['SMA20'] + 2 * df['close'].rolling(window=20).std()
-    df['Bollinger_Lower'] = df['SMA20'] - 2 * df['close'].rolling(window=20).std()
+    # Price Action
+    df['hammer'] = ((df['close'] - df['low']) > 2 * (df['open'] - df['close'])) & (df['close'] > df['open'])
+    df['shooting_star'] = ((df['high'] - df['close']) > 2 * (df['close'] - df['open'])) & (df['close'] < df['open'])
 
-    df.dropna(inplace=True)
-    return df
+    # Padronização robusta
+    scaler = RobustScaler()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+
+    return df.dropna()
 
 
-# Função para treinar o modelo de IA
 def treinar_modelo():
     global modelo
-    moeda = moeda_selecionada.get()
-    df = coletar_dados(moeda)
-    df = calcular_indicadores(df)
-    df['Target'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)
-    print("Distribuição das classes:")
-    print(df['Target'].value_counts())  # Verificar a distribuição das classes
-    X = df.drop(['Target'], axis=1)
-    y = df['Target']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    modelo = Pipeline([
-        ('scaler', StandardScaler()),
-        ('classifier', RandomForestClassifier(n_estimators=200, max_depth=7, class_weight='balanced'))
-    ])
-    modelo.fit(X_train, y_train)
-    # Validação do modelo
-    y_pred = modelo.predict(X_test)
-    log(f"Acurácia: {accuracy_score(y_test, y_pred):.2%}")
-    log(classification_report(y_test, y_pred))
+    try:
+        df = calcular_indicadores(coletar_dados(moeda_selecionada.get()))
+        df['Target'] = ((df['close'].shift(-5) > (df['close'] * (1 + TAKE_PROFIT))).astype(int))  # Alvo de 5 velas
+
+        X, y = SMOTE().fit_resample(df.drop(['Target'], axis=1), df['Target'])
+
+        tscv = TimeSeriesSplit(n_splits=5)
+        modelo = GridSearchCV(
+            Pipeline([
+                ('scaler', RobustScaler()),
+                ('model', LGBMClassifier(boosting_type='dart', class_weight='balanced'))
+            ]),
+            {
+                'model__num_leaves': [31, 63],
+                'model__learning_rate': [0.01, 0.05],
+                'model__n_estimators': [200, 300]
+            },
+            cv=tscv,
+            scoring=make_scorer(f1_score),
+            n_jobs=-1
+        ).fit(X, y)
+
+        log(f"🔥 F1-Score: {modelo.best_score_:.2%}")
+        log(f"Melhores parâmetros: {modelo.best_params_}")
+    except Exception as e:
+        log(f"Erro no treinamento: {str(e)}")
 
 
-# Função para gerar o sinal de compra/venda
 def gerar_sinal():
-    global modelo
-    if modelo is None:
-        return "Aguardando...", "gray", 0.0
-    moeda = moeda_selecionada.get()
-    df = coletar_dados(moeda)
-    df = calcular_indicadores(df)
-    X = df.iloc[[-1]]  # Usa apenas os dados mais recentes
-    proba = modelo.predict_proba(X)[0][1]
-    if proba > 0.65:  # Limiar ajustado para 0.65
-        return "COMPRAR", "green", proba
-    elif proba < 0.35:  # Limiar ajustado para 0.35
-        return "VENDER", "red", proba
-    else:
-        return "NEUTRO", "gray", proba
+    if modelo is None: return ("AGUARDE", "gray", 0.0, 0.0)
+
+    try:
+        df = calcular_indicadores(coletar_dados(moeda_selecionada.get()))
+        features = df.iloc[[-1]].drop(['Target'], axis=1, errors='ignore')
+
+        proba = modelo.predict_proba(features)[0][1]
+        volatilidade = df['close'].pct_change().std()
+
+        # Limiares dinâmicos baseados na volatilidade
+        limiar_compra = np.clip(0.82 - (volatilidade * 10), 0.65, 0.90)
+        limiar_venda = np.clip(0.18 + (volatilidade * 10), 0.10, 0.35)
+
+        if proba > limiar_compra:
+            return ("🚀 COMPRAR", "#00ff88", proba, volatilidade)
+        elif proba < limiar_venda:
+            return ("🔻 VENDER", "#ff4444", proba, volatilidade)
+        return ("⏸ NEUTRO", "#aaaaaa", proba, volatilidade)
+    except Exception as e:
+        log(f"Erro na geração de sinal: {str(e)}")
+        return ("ERRO", "gray", 0.0, 0.0)
 
 
-# Função para atualizar o sinal de compra/venda
-def atualizar_sinal():
+def executar_operacao(sinal):
+    global operacoes
+    entrada = time.time()
+    resultado = "GANHO" if np.random.rand() < 0.8 else "PERDA"  # Simulação - implementar lógica real
+    operacoes.append((entrada, sinal, resultado))
+    log(f"Operação: {sinal[0]} | Resultado: {resultado}")
+
+
+def atualizar_contagem():
+    global tempo_restante
     while bot_rodando:
-        try:
-            texto, cor, proba = gerar_sinal()
-            label_sinal.config(text=f"{texto} ({proba:.2%})", fg=cor)
-            historico_sinais.append((texto, proba))
-            atualizar_grafico()
+        if tempo_restante > 0:
+            tempo_restante -= 1
+            label_contagem.config(text=f"⏳ {tempo_restante}s")
             root.update()
-            time.sleep(60)  # Atualiza a cada 60 segundos
-        except Exception as e:
-            log(f"Erro na atualização: {str(e)}")
+            time.sleep(1)
+        else:
+            tempo_restante = 300
+            sinal = gerar_sinal()
+            label_sinal.config(text=f"{sinal[0]} ({sinal[2]:.2%}) | Vlt: {sinal[3]:.2%}", fg=sinal[1])
+            executar_operacao(sinal)
+            atualizar_grafico()
 
 
-# Função para atualizar o gráfico de candlesticks
-def atualizar_grafico():
-    moeda = moeda_selecionada.get()
-    df = coletar_dados(moeda)
-    ax.clear()
-    mpf.plot(df, type='candle', style='charles', ax=ax, volume=False)
-    canvas.draw()
+def atualizar_status():
+    status_led.config(fg="#00ff00" if bot_rodando else "#ff0000")
+    root.after(500, atualizar_status)
 
 
 # Função para iniciar/parar o bot
 def iniciar_parar_bot():
     global bot_rodando
-    if not bot_rodando:
-        treinar_modelo()
-        bot_rodando = True
-        threading.Thread(target=atualizar_sinal).start()
-        botao_iniciar.config(text="Parar Bot", bg="red")
-    else:
+    if bot_rodando:
         bot_rodando = False
-        botao_iniciar.config(text="Iniciar Bot", bg="green")
-
-
-# Função para atualizar o sinal manualmente
-def atualizar_sinal_manual():
-    texto, cor, proba = gerar_sinal()
-    label_sinal.config(text=f"{texto} ({proba:.2%})", fg=cor)
-    historico_sinais.append((texto, proba))
-    atualizar_grafico()
-    root.update()
-
-
-# Função para ativar/desativar o auto refresh
-def alternar_auto_refresh():
-    global auto_refresh_rodando
-    if not auto_refresh_rodando:
-        auto_refresh_rodando = True
-        botao_auto_refresh.config(text="Desativar Auto Refresh", bg="red")
-        threading.Thread(target=auto_refresh).start()
+        log("🛑 Bot parado")
+        label_sinal.config(text="🔄 INICIE O BOT", fg="gray")
     else:
-        auto_refresh_rodando = False
-        botao_auto_refresh.config(text="Ativar Auto Refresh", bg="green")
+        bot_rodando = True
+        log("🚀 Bot iniciado")
+        threading.Thread(target=atualizar_contagem).start()
 
 
-# Função para auto refresh
-def auto_refresh():
-    while auto_refresh_rodando:
-        try:
-            atualizar_sinal_manual()
-            time.sleep(30)  # Atualiza a cada 30 segundos
-        except Exception as e:
-            log(f"Erro no auto refresh: {str(e)}")
+# Controles da Interface
+frame_controles = Frame(root, bg="#1a1a1a")
+menu_moedas = OptionMenu(frame_controles, moeda_selecionada, *MOEDAS_DISPONIVEIS)
+botao_iniciar = Button(frame_controles, text="INICIAR BOT", command=lambda: [treinar_modelo(), iniciar_parar_bot()])
+botao_parar = Button(frame_controles, text="PARAR BOT", command=iniciar_parar_bot)
 
+# Aplicando estilos aos botões
+estilo_botao(menu_moedas, "#363636", "#4a4a4a")
+estilo_botao(botao_iniciar, "#00aa00", "#00cc00")
+estilo_botao(botao_parar, "#ff4444", "#ff6666")
 
-# Função para exibir logs
-def log(mensagem):
-    texto_log.insert(END, f"{mensagem}\n")
-    texto_log.see(END)
-
-
-# Criando interface gráfica
-root = Tk()
-root.title("Bot de Trading com IA")
-root.configure(bg="#2c3e50")
-
-# Variável de controle para seleção de moeda (criada após a janela principal)
-moeda_selecionada = StringVar(value=MOEDAS_DISPONIVEIS[0])  # Moeda padrão
-
-# Frame para o gráfico
-frame_grafico = Frame(root, bg="#2c3e50")
-frame_grafico.pack(pady=20)
-
-fig, ax = plt.subplots(figsize=(10, 4))
-canvas = FigureCanvasTkAgg(fig, master=frame_grafico)
+# Layout atualizado
+status_frame.pack(pady=10)
+status_led.pack()
+frame_grafico.pack(pady=10)
 canvas.get_tk_widget().pack()
+label_sinal.pack(pady=15)
+label_contagem.pack()
+frame_controles.pack(pady=15)
+menu_moedas.pack(side="left", padx=5)
+botao_iniciar.pack(side="left", padx=5)
+botao_parar.pack(side="left", padx=5)
+texto_log.pack(pady=15)
 
-# Label para o sinal
-label_sinal = Label(root, text="Aguardando...", font=("Helvetica", 24, "bold"), bg="#2c3e50", fg="gray")
-label_sinal.pack(pady=20)
-
-# Botão para selecionar moeda
-label_moeda = Label(root, text="Selecione a Moeda:", font=("Helvetica", 12), bg="#2c3e50", fg="white")
-label_moeda.pack(pady=5)
-
-menu_moedas = OptionMenu(root, moeda_selecionada, *MOEDAS_DISPONIVEIS)
-menu_moedas.config(font=("Helvetica", 12), bg="#34495e", fg="white")
-menu_moedas.pack(pady=10)
-
-# Botões
-botao_iniciar = Button(root, text="Iniciar Bot", command=iniciar_parar_bot, font=("Helvetica", 14), bg="green",
-                       fg="white")
-botao_iniciar.pack(pady=10)
-
-botao_refresh = Button(root, text="Refresh", command=atualizar_sinal_manual, font=("Helvetica", 14), bg="blue",
-                       fg="white")
-botao_refresh.pack(pady=10)
-
-botao_auto_refresh = Button(root, text="Ativar Auto Refresh", command=alternar_auto_refresh, font=("Helvetica", 14),
-                            bg="green", fg="white")
-botao_auto_refresh.pack(pady=10)
-
-# Área de logs
-texto_log = Text(root, height=10, width=80, bg="#34495e", fg="white")
-texto_log.pack(pady=20)
-
+atualizar_status()
 root.mainloop()
